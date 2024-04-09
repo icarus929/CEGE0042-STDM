@@ -1,0 +1,454 @@
+---
+title: "Monthly max temperature prediction in England based on ARIMA and STARIMA models"
+date: "2024-04-04"
+output:
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, message=FALSE, warning=FALSE, include = TRUE)
+```
+
+## Install and Load Required Packages
+
+```{r}
+required_packages <- c(
+  "raster", "ncdf4", "sf", "ggplot2", "dplyr", "tmap",
+  "spdep", "knitr", "forecast", "gridExtra")
+
+for (pkg in required_packages) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg)
+  }
+  suppressMessages(library(pkg, character.only = TRUE))
+}
+
+source("data/starima_package.R")
+```
+
+## Data Preparation
+
+```{r}
+# open the first .nc file to get the uk area bound box 
+path <- 'data/tasmax_12km/tasmax_hadukgrid_uk_12km_mon_195301-195312.nc'
+# open the NetCDF connection
+nc <- nc_open(path)
+# get the x,y bounds of data area
+x_bnds <- ncvar_get(nc, 'projection_x_coordinate_bnds')
+y_bnds <- ncvar_get(nc, 'projection_y_coordinate_bnds')
+# close the NetCDF connection
+nc_close(nc)
+```
+
+```{r}
+# create the sf data frame from polygons that are created by the bound box
+# function of creation of polygon object from grid bounds
+create_polygons_from_bounds <- function(x_bnds, y_bnds) {
+  lapply(seq_len(dim(x_bnds)[2]), function(i) {
+    lapply(seq_len(dim(y_bnds)[2]), function(j) {
+      # Counterclockwise starting from the lower left corner
+      polygon_coords <- matrix(c(x_bnds[1, i], y_bnds[1, j],
+                                 x_bnds[1, i], y_bnds[2, j],
+                                 x_bnds[2, i], y_bnds[2, j],
+                                 x_bnds[2, i], y_bnds[1, j],
+                                 x_bnds[1, i], y_bnds[1, j]),
+                               byrow = TRUE, ncol = 2)
+      st_polygon(list(polygon_coords))
+    })
+  }) |> unlist(recursive = FALSE)
+}
+
+# create the polygons
+polygons <- create_polygons_from_bounds(x_bnds, y_bnds)
+# combine the list of polygons into a single 'sfc' (simple feature collection) object
+sfc_polygons <- st_sfc(polygons)
+# set the CRS for the polygons (EPSG:27700) 
+sfc_polygons <- st_set_crs(sfc_polygons, 27700)
+# create an sf data frame
+sf_df <- st_sf(geometry = sfc_polygons)
+```
+
+```{r}
+# write the tasmax values into the sf data frame, and create a matrix for following analysis
+# directory where all the NetCDF files are located
+file_dir <- "data/tasmax_12km"
+file_names <- list.files(file_dir, pattern = "\\.nc$", full.names = TRUE)
+
+# loop over each NetCDF file to construct the dataframe 
+for (file_path in file_names) {
+  # open the NetCDF file
+  nc <- nc_open(file_path)
+  # extract the year from the file name
+  year <- sub(".*/tasmax_hadukgrid_uk_12km_mon_(\\d{4}).*.nc$", "\\1", file_path)
+  # extract tasmax values for each month
+  for (month in 1:12) {
+    # construct the column name
+    column_name <- paste(year, sprintf("%02d", month), sep = "-")
+    # get the tasmax values for the current month
+    tasmax_values <- ncvar_get(nc, 'tasmax', start = c(1, 1, month), count = c(-1, -1, 1))
+    # number of rows (latitude/y) and columns (longitude/x)
+    num_y <- dim(tasmax_values)[2]
+    num_x <- dim(tasmax_values)[1]
+    # initialize a vector to hold the reordered data
+    reordered_tasmax_values <- vector("numeric", length = num_y * num_x)
+    # loop through each grid cell in the order of the sf object and assign values from tasmax
+    index <- 1
+    for (x in 1:num_x) {
+      for (y in 1:num_y) { 
+        reordered_tasmax_values[index] <- tasmax_values[x, y]
+        index <- index + 1
+      }
+    }
+    # add it as a column to the sf object
+    sf_df[[column_name]] <- reordered_tasmax_values
+  }
+  # close the NetCDF file
+  nc_close(nc)
+}
+
+# remove rows with any NA values
+sf_df_clean <- na.omit(sf_df)
+```
+
+```{r}
+# aggregate grid value to the England boroughs
+Eng_boroughs <- st_read(dsn="data/England_borough.gpkg") %>% rename("geometry" = "geom")
+Eng_boroughs <- Eng_boroughs['NAME']
+Eng_features <- st_read(dsn="data/England_feature.gpkg") %>% rename("geometry" = "geom")
+columns_to_aggregate <- names(sf_df_clean)[which(names(sf_df_clean) != "geometry")]
+sf_aggregated <- Eng_boroughs %>%
+  st_join(sf_df_clean) %>%
+  filter(!if_any(all_of(columns_to_aggregate), is.na)) %>% # remove rows where any of the columns_to_aggregate is NA
+  group_by(NAME,geometry) %>%
+  summarize(
+    across(all_of(columns_to_aggregate), mean, na.rm = TRUE),
+    .groups = 'drop'
+  )
+sf_aggregated1 <- left_join(sf_aggregated,as.data.frame(Eng_features)[,c('NAME', 'Elvation', 'latitude','prop_manmade_area','prop_forest','prop_water')],by = "NAME")
+# drop the geometry column and then convert the data to a matrix
+sf_aggregated_matrix<-data.matrix(st_drop_geometry(sf_aggregated[,-1]))
+rownames(sf_aggregated_matrix) <- st_drop_geometry(sf_aggregated)$NAME
+t_sf_aggregated_matrix <- t(sf_aggregated_matrix) # STACF etc. needs time series in columns
+```
+
+```{r include=TRUE, fig.show='hold', out.width='50%'}
+# data visualization
+brks=quantile(as.numeric(unlist(sf_aggregated_matrix)), seq(0,1,0.1)) 
+# the max temperature of January 2022
+tm_shape(sf_aggregated)+ 
+  tm_fill("2022-01", style="fixed", palette="-Spectral",breaks=brks,
+          showNA= FALSE)+
+  # tm_borders("white")+
+  tm_compass(position=c("left","top"))+
+  tm_legend(position=c("left","bottom"))+
+  tm_scale_bar(breaks = c(0, 25, 50, 100,200),text.size=2) # +district_line
+# the max temperature of July 2022
+tm_shape(sf_aggregated)+ 
+  tm_fill("2022-07", style="fixed", palette="-Spectral",breaks=brks,
+          showNA= FALSE)+
+  # tm_borders("white")+
+  tm_compass(position=c("left","top"))+
+  tm_legend(position=c("left","bottom"))+
+  tm_scale_bar(breaks = c(0, 25, 50, 100,200),text.size=2) # +district_line
+```
+
+## Exploratory spatio-temporal data analysis
+
+```{r}
+# Examining non spatio-temporal data characteristics
+mu2 = mean(sf_aggregated_matrix)
+mu2
+sdev2 = sd(sf_aggregated_matrix)
+sdev2
+```
+
+```{r include=TRUE, fig.show='hold', out.width='50%'}
+# Examining non spatio-temporal data characteristics
+hist(sf_aggregated_matrix)
+abline(v=mu2, col="red")
+
+qqnorm(sf_aggregated_matrix)
+qqline(sf_aggregated_matrix, col="red")
+```
+
+```{r include=TRUE}
+# Examining non spatio-temporal data characteristics
+pairs(~Elvation+latitude+prop_forest+rowMeans(sf_aggregated_matrix),data=as.data.frame(sf_aggregated1),
+      main="Simple Scatterplot Matrix",
+      panel=function(x, y, ...) {
+          points(x, y, cex=0.5, ...) 
+      }
+)
+```
+
+```{r include=TRUE, fig.show='hold', out.width='50%'}
+# Examining temporal characteristics
+plot(colMeans(sf_aggregated_matrix), xlab = "Month", ylab = "tasmax", type="l", xaxt="n")
+axis(1, at = seq(0, 720, 120), labels=seq(1953, 2013, 10))
+
+# Create the heatmap,with latitude descending from top to bottom
+sf_aggregated1 <- left_join(sf_aggregated,as.data.frame(Eng_features)[,c('NAME', 'Elvation', 'latitude','prop_manmade_area','prop_forest','prop_water')],by = "NAME")
+sf_latitude_order <- sf_aggregated1 %>% arrange(prop_water)
+sf_latitude_ordermatrix <- data.matrix(as.data.frame(sf_latitude_order)[,3:842]) 
+rownames(sf_latitude_ordermatrix) <- sf_latitude_order$NAME
+
+heatmap(sf_latitude_ordermatrix,Rowv=NA,Colv=NA, col=heat.colors(256),scale="none", margins=c(5,3),xlab="Month", cexCol=1.1,y.scale.components.subticks(n=10))
+```
+
+```{r}
+# Examining spatial autocorrelation
+W <- nb2listw(poly2nb(sf_aggregated),zero.policy = TRUE)
+# two ways to do the statistical test of moran's I
+moran.test(x=rowMeans(sf_aggregated_matrix), listw=W)
+moran.mc(x=rowMeans(sf_aggregated_matrix), listw=W, nsim=9999)
+```
+
+```{r include=TRUE, fig.show='hold', out.width='50%'}
+# Examining spatial autocorrelation
+# local moran' I
+Ii <- localmoran(x=rowMeans(sf_aggregated_matrix), listw=W)
+eng_tasmax_sf <- sf_aggregated[,2]
+eng_tasmax_sf$avg_tasmax <- as.data.frame(rowMeans(sf_aggregated_matrix))[,1]
+eng_tasmax_sf$Ii <- Ii[,'Ii']
+tm_shape(eng_tasmax_sf) +
+  tm_borders(lwd = 0.1)+ 
+  tm_polygons(col="Ii", palette="-RdBu", style="quantile",size= 0)
+
+# unadjusted p-values
+eng_tasmax_sf$Iip_unadjusted <- Ii[,"Pr(z != E(Ii))"]
+eng_tasmax_sf$Ii_un_sig <- "nonsignificant"
+eng_tasmax_sf$Ii_un_sig[which(eng_tasmax_sf$Iip_unadjusted < 0.05)] <- "significant"
+# statistically significant units with the unadjusted p-value
+# tm_shape(eng_tasmax_sf) +
+#   tm_borders(lwd = 0.1)+ 
+#   tm_polygons(col="Ii_un_sig", palette="-RdBu")
+
+# apply the Bonferroni adjustment to the p-values directly using the  p.adjust
+eng_tasmax_sf$Iip_adjusted <- p.adjust(eng_tasmax_sf$Iip_unadjusted, method="bonferroni")  
+eng_tasmax_sf$Ii_ad_sig <- "nonsignificant"
+eng_tasmax_sf$Ii_ad_sig[which(eng_tasmax_sf$Iip_adjusted < 0.05)] <- "significant"
+# tm_shape(eng_tasmax_sf) +
+#   tm_borders(lwd = 0)+ 
+#   tm_polygons(col="Ii_ad_sig", palette="-RdBu")
+
+# steps to get the clusters of high value and low value
+moranCluster <- function(shape, W, var, alpha=0.05, p.adjust.method="bonferroni")  
+{
+  # Code adapted from https://rpubs.com/Hailstone/346625
+  Ii <- localmoran(shape[[var]], W)
+  shape$Ii <- Ii[,"Ii"]
+  Iip <- p.adjust(Ii[,"Pr(z != E(Ii))"], method=p.adjust.method)
+  shape$Iip <- Iip
+  shape$sig <- shape$Iip<alpha
+  # Scale the data to obtain low and high values
+  shape$scaled <- scale(shape[[var]]) # high low values at location i
+  shape$lag_scaled <- lag.listw(W, shape$scaled) # high low values at neighbours j
+  shape$lag_cat <- factor(ifelse(shape$scaled>0 & shape$lag_scaled>0, "HH",
+                                 ifelse(shape$scaled>0 & shape$lag_scaled<0, "HL",
+                                        ifelse(shape$scaled<0 & shape$lag_scaled<0, "LL",
+                                               ifelse(shape$scaled<0 & shape$lag_scaled<0, "LH", "Equivalent")))))
+  shape$sig_cluster <- as.character(shape$lag_cat)
+  shape$sig_cluster[!shape$sig] <- "Non-sig"
+  shape$sig_cluster <- as.factor(shape$sig_cluster)
+  results <- data.frame(Ii=shape$Ii, pvalue=shape$Iip, type=shape$lag_cat, sig=shape$sig_cluster)
+  
+  return(list(results=results))
+}
+clusters <- moranCluster(eng_tasmax_sf, W=W, var="avg_tasmax")$results
+eng_tasmax_sf$Ii_cluster <- clusters$sig
+
+tm_shape(eng_tasmax_sf) + tm_borders(lwd = 0)+tm_polygons(col="Ii_cluster")
+```
+
+## Methodology and results
+
+### Time series decomposition
+```{r include=TRUE}
+# Decomposition for City of London time series
+ts_london <- ts(t_sf_aggregated_matrix[,'City and County of the City of London'], start=c(1953-01, 1), frequency=12)
+
+decom_london <- stats::decompose(ts_london)
+autoplot(decom_london)
+```
+
+### S-ARIMA Models
+
+#### Autocorrelation and partial autocorrelation analysis
+
+```{r include=TRUE, fig.show='hold', out.width='50%'}
+# autocorrelation of a specific borough(London), max temperature series for the first 48 lags
+acf(sf_aggregated_matrix['City and County of the City of London',], lag.max=48, xlab="Lag", ylab="ACF", main="Autocorrelation plot of monthly maximum air temperatures")
+pacf(sf_aggregated_matrix['City and County of the City of London',], lag.max=48, xlab="Lag", ylab="PACF",main="Partial Autocorrelation plot") 
+
+T.s.diff <- diff(sf_aggregated_matrix['City and County of the City of London',], lag=12, differences=1)
+
+acf(T.s.diff, lag.max=48, xlab="Lag", ylab="ACF", main="Differenced Autocorrelation plot") 
+# q candidates:[1,2,3/1,2,3,4,5]
+pacf(T.s.diff, lag.max=48, xlab="Lag", ylab="PACF",main="Differenced Partial Autocorrelation plot") 
+# p candidates:[1/1,2]
+```
+
+#### Parameter estimation and fitting
+```{r}
+# ARIMA(1,0,3)(2,1,5)12-----initial combination of parameters
+fit.ar <- arima(sf_aggregated_matrix['City and County of the City of London',1:780],order=c(1,0,3),seasonal=list(order=c(2,1,5),period=12))
+fit.ar  # aic = 2914.9
+NRMSE_fit <- NRMSE(res=fit.ar$residuals, obs=sf_aggregated_matrix['City and County of the City of London',1:780])
+NRMSE_fit # 0.2700663
+
+# several try came across different directions
+# ARIMA(1,0,3)(0,1,5)12
+fit.ar <- arima(sf_aggregated_matrix['City and County of the City of London',1:780],order=c(1,0,3),seasonal=list(order=c(0,1,5),period=12))
+fit.ar  # aic = 2914.49
+NRMSE_fit <- NRMSE(res=fit.ar$residuals, obs=sf_aggregated_matrix['City and County of the City of London',1:780])
+NRMSE_fit # 0.2710715
+
+# ARIMA (1,0,4) (2,1,5)12
+fit.ar <- arima(sf_aggregated_matrix['City and County of the City of London',1:780],order=c(1,0,4),seasonal=list(order=c(2,1,5),period=12))
+fit.ar  # aic = 2913.22
+NRMSE_fit <- NRMSE(res=fit.ar$residuals, obs=sf_aggregated_matrix['City and County of the City of London',1:780])
+NRMSE_fit # 0.2691755
+
+# ARIMA(1,0,3) (2,1,6)12----the selected combination 
+fit.ar <- arima(sf_aggregated_matrix['City and County of the City of London',1:780],order=c(1,0,3),seasonal=list(order=c(2,1,6),period=12))
+fit.ar  # aic = 2910.26
+NRMSE_fit <- NRMSE(res=fit.ar$residuals, obs=sf_aggregated_matrix['City and County of the City of London',1:780])
+NRMSE_fit # 0.2678122
+
+# # ADDITIONAL TRY-----------
+# # ARI(1,0,0)(2,1,0)12
+# fit.ar <- arima(sf_aggregated_matrix['City and County of the City of London',1:780],order=c(1,0,0),seasonal=list(order=c(2,1,0),period=12))
+# fit.ar  # aic = 3099.05
+# NRMSE_fit <- NRMSE(res=fit.ar$residuals, obs=sf_aggregated_matrix['City and County of the City of London',1:780])
+# NRMSE_fit # 0.3142105
+# 
+# # IMA(0,0,3)(0,1,5)12
+# fit.ar <- arima(sf_aggregated_matrix['City and County of the City of London',1:780],order=c(0,0,3),seasonal=list(order=c(0,1,5),period=12))
+# fit.ar  # aic = 2926.33
+# NRMSE_fit <- NRMSE(res=fit.ar$residuals, obs=sf_aggregated_matrix['City and County of the City of London',1:780])
+# NRMSE_fit # 0.2756825
+# 
+# # ARIMA(1,0,4)(2,1,1)12
+# fit.ar <- arima(sf_aggregated_matrix['City and County of the City of London',1:780],order=c(1,0,4),seasonal=list(order=c(2,1,1),period=12))
+# fit.ar  # aic = 2916.47
+# NRMSE_fit <- NRMSE(res=fit.ar$residuals, obs=sf_aggregated_matrix['City and County of the City of London',1:780])
+# NRMSE_fit # 0.2701743
+# 
+# # ARIMA(1,0,4)(4,1,1)12
+# fit.ar <- arima(sf_aggregated_matrix['City and County of the City of London',1:780],order=c(1,0,4),seasonal=list(order=c(4,1,1),period=12))
+# fit.ar  # aic = 2913
+# NRMSE_fit <- NRMSE(res=fit.ar$residuals, obs=sf_aggregated_matrix['City and County of the City of London',1:780])
+# NRMSE_fit # 0.2703979
+```
+
+#### Diagnostic Checking
+
+```{r include=TRUE}
+tsdiag(fit.ar)
+```
+
+#### Prediction
+```{r include=TRUE}
+fit.Ar <- Arima(sf_aggregated_matrix['City and County of the City of London',1:780],order=c(1,0,3),seasonal=list(order=c(2,1,6),period=12))
+pre.Ar <- Arima(sf_aggregated_matrix['City and County of the City of London',781:840], model=fit.Ar)
+matplot(cbind(pre.Ar$fitted, pre.Ar$x), type="l")
+
+NRMSE_fit1 <- NRMSE(res=pre.Ar$residuals, obs=sf_aggregated_matrix['City and County of the City of London',781:840])
+NRMSE_fit1 # 0.2250566
+```
+
+```{r include=TRUE}
+# Fitting the model using auto.arima
+fit.auto.ar <- auto.arima(sf_aggregated_matrix['City and County of the City of London',1:780])
+# fit.auto.ar # aic = 3244.75
+NRMSE_fit2 <- NRMSE(res=fit.auto.ar$residuals, obs=sf_aggregated_matrix['City and County of the City of London',1:780])
+NRMSE_fit2 # 0.3356572
+fit.auto.Ar <- Arima(sf_aggregated_matrix['City and County of the City of London',1:780],order=c(5,0,1))
+pre.auto.Ar <- Arima(sf_aggregated_matrix['City and County of the City of London',781:840], model=fit.auto.Ar)
+NRMSE_fit22 <- NRMSE(res=pre.auto.Ar$residuals, obs=sf_aggregated_matrix['City and County of the City of London',781:840])
+NRMSE_fit22 # 0.3643618
+matplot(cbind(pre.auto.Ar$fitted, pre.auto.Ar$x), type="l")
+```
+
+### STARIMA Models
+
+#### Weight Matrix Definition
+```{r}
+nbrs <- poly2nb(sf_aggregated)
+W1 <- nb2mat(nbrs)
+Wlist <- nblag(nbrs, 3)
+W2 <- nb2mat(Wlist[[2]])
+W0 <- diag(x=1, nrow(W1), ncol(W1))
+```
+
+#### Spatiotemporal autocorrelation analysis
+```{r}
+t_sf_aggregated_matrix.diff <- diff(t_sf_aggregated_matrix,lag=12,differences= 1)
+```
+
+```{r}
+# stacf(t_sf_aggregated_matrix.diff, W0, 120)
+```
+
+```{r include=TRUE, fig.show='hold', out.width='50%'}
+# ACF
+stacf(t_sf_aggregated_matrix, W1, 60)
+# ACF-diff
+stacf(t_sf_aggregated_matrix.diff, W1, 60)
+# PACF
+stpacf(t_sf_aggregated_matrix, W1, 60)
+# PACF-diff
+stpacf(t_sf_aggregated_matrix.diff,W1,60)
+```
+
+
+#### Parameter estimation and fitting
+
+```{r}
+W_fit<-list(w1=W1) # Create a list of spatial weight matrices, zero not needed
+# W_fit$w2 <- W2
+fit.star101 <- starima_fit(Z=t_sf_aggregated_matrix[1:780,],W=W_fit,p=1,d=12,q=1)  
+fit.star102 <- starima_fit(Z=t_sf_aggregated_matrix[1:780,],W=W_fit,p=1,d=12,q=2)  
+fit.star103 <- starima_fit(Z=t_sf_aggregated_matrix[1:780,],W=W_fit,p=1,d=12,q=3)  
+fit.star001 <- starima_fit(Z=t_sf_aggregated_matrix[1:780,],W=W_fit,p=0,d=12,q=1)  
+fit.star100 <- starima_fit(Z=t_sf_aggregated_matrix[1:780,],W=W_fit,p=1,d=12,q=0)
+fit.star101$NRMSE[56] # 0.3812036
+fit.star102$NRMSE[56] # 0.3814073
+fit.star103$NRMSE[56] # 0.3814507
+fit.star001$NRMSE[56] # 0.3912485
+fit.star100$NRMSE[56] # 0.3806741 the selected one
+```
+
+#### Diagnostic Checking
+```{r include=TRUE, fig.show='hold', out.width='50%'}
+fit.star100$NRMSE[56]
+stacf(fit.star100$RES,W1,48)
+hist(fit.star100$RES[,56])
+Box.test(fit.star100$RES[,56],lag=1, type="Ljung") # p= 0.7233
+```
+
+#### Forecasting
+```{r include=TRUE}
+pre.star <- starima_pre(t_sf_aggregated_matrix[(780-12-1+1):840,],model=fit.star100)
+matplot(1:60,cbind(t_sf_aggregated_matrix[781:840,56],pre.star$PRE[,56]),type="l")
+```
+```{r}
+# show the forecast accuracy of the STARIMA model vary across the study area
+df <- as.data.frame(pre.star$PRE['2021-07',])
+df$OBS <- as.vector(pre.star$OBS['2021-07',])
+colnames(df)[1:2] <- c("PRE", "OBS")
+df <- df %>%
+  mutate(differ = PRE - OBS)
+df$NAME <- rownames(df)
+sf_aggregated2 <- sf_aggregated1[,1]
+sf_aggregated2 <- sf_aggregated2 %>%
+  left_join(df, by = "NAME")
+ggplot(sf_aggregated2) +
+  geom_sf(aes(fill = differ)) +
+  scale_fill_viridis_c() +
+  theme_minimal() +
+  labs(fill = "Difference")
+```
+
+
+
